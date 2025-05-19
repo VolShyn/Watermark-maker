@@ -1,0 +1,7 @@
+.venv
+.zed
+.ropeproject
+__pycache__
+downloaded_images/
+watermarked_images/
+*.xlsx
