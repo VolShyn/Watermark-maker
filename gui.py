@@ -7,10 +7,16 @@ import threading
 # import functions from url.py
 try:
     # when running from the same directory
-    from url import download_image, add_border_and_watermark, ensure_dir, load_image_urls, DOWNLOAD_DIR, OUTPUT_DIR
+    from fetch import download_image, add_border_and_watermark, ensure_dir, load_code_image_urls
 except ImportError:
     # when running as a package
-    from .url import download_image, add_border_and_watermark, ensure_dir, load_image_urls, DOWNLOAD_DIR, OUTPUT_DIR
+    from .fetch import download_image, add_border_and_watermark, ensure_dir, load_code_image_urls
+
+
+EXCEL_PATH = 'export-products-17-05-25_21-55-25.xlsx'
+SHEET_NAME = 'Export Products Sheet'
+DOWNLOAD_DIR = 'downloaded_images'
+OUTPUT_DIR = 'watermarked_images'
 
 class ImageProcessorApp:
     def __init__(self, root):
@@ -22,6 +28,7 @@ class ImageProcessorApp:
         self.excel_path = tk.StringVar()
         self.sheet_name = tk.StringVar()
         self.image_column = tk.StringVar(value="Ссылка_изображения")  # default
+        self.code_column = tk.StringVar(value="Код_товара")  # default
 
         self.available_sheets = []
         self.available_columns = []
@@ -52,6 +59,10 @@ class ImageProcessorApp:
         ttk.Label(frame2, text="Image URL Column:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.column_combobox = ttk.Combobox(frame2, textvariable=self.image_column, state="readonly")
         self.column_combobox.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+
+        ttk.Label(frame2, text="Code Column:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self.code_combobox = ttk.Combobox(frame2, textvariable=self.code_column, state="readonly")
+        self.code_combobox.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
 
         # action buttons
         frame3 = ttk.Frame(self.root)
@@ -117,12 +128,18 @@ class ImageProcessorApp:
             df = pd.read_excel(self.excel_path.get(), sheet_name=self.sheet_name.get())
             self.available_columns = df.columns.tolist()
             self.column_combobox["values"] = self.available_columns
+            self.code_combobox["values"] = self.available_columns
 
-            # trying to select the default image column or the first column
+            # trying to select the default image/code column or the first column
             if "Ссылка_изображения" in self.available_columns:
                 self.image_column.set("Ссылка_изображения")
             elif self.available_columns:
                 self.image_column.set(self.available_columns[0])
+
+            if "Код_товара" in self.available_columns:
+                self.code_column.set("Код_товара")
+            elif self.available_columns:
+                self.code_column.set(self.available_columns[0])
 
             self.status_update(f"Loaded {len(self.available_columns)} columns")
         except Exception as e:
@@ -133,31 +150,38 @@ class ImageProcessorApp:
         if not self._validate_inputs():
             return
 
-        # Start downloading in a separate thread
+        # start downloading in a separate thread
         threading.Thread(target=self._download_images_thread, daemon=True).start()
 
     def _download_images_thread(self):
         self.status_update("Starting download process...")
         try:
-            # Load image URLs
-            urls = load_image_urls(
+            # load (code, image_urls) tuples
+            code_image_tuples = load_code_image_urls(
                 self.excel_path.get(),
                 self.sheet_name.get(),
+                self.code_column.get(),
                 self.image_column.get()
             )
 
-            self.status_update(f"Found {len(urls)} image URLs to download.")
+            self.status_update(f"Found {len(code_image_tuples)} rows to process.")
 
-            # Download each image
-            for i, url in enumerate(urls):
-                self.status_update(f"Downloading {i+1}/{len(urls)}: {url}")
-                fname = download_image(url, DOWNLOAD_DIR)
-                if not fname:
-                    self.status_update(f"✗ Failed to download {url}")
-                else:
-                    self.status_update(f"✓ Downloaded {fname}")
+            total_images = 0
+            for i, (code, image_urls) in enumerate(code_image_tuples):
+                # Split image_urls by comma if multiple URLs in one cell
+                url_list = [u.strip() for u in str(image_urls).split(",") if u.strip()]
+                code_dir = os.path.join(DOWNLOAD_DIR, str(code))
+                ensure_dir(code_dir)
+                for url in url_list:
+                    self.status_update(f"Downloading for code {code}: {url}")
+                    fname = download_image(url, code_dir)
+                    if not fname:
+                        self.status_update(f"✗ Failed to download {url}")
+                    else:
+                        self.status_update(f"✓ Downloaded {fname} to {code_dir}")
+                    total_images += 1
 
-            self.status_update("Download process completed")
+            self.status_update(f"Download process completed. Total images attempted: {total_images}")
             messagebox.showinfo("Success", "All images are downloaded")
         except Exception as e:
             self.status_update(f"Error during download: {e}")
@@ -170,27 +194,36 @@ class ImageProcessorApp:
     def _add_watermarks_thread(self):
         self.status_update("Starting watermarking process...")
         try:
-            # get the list of downloaded images
-            downloaded_files = [f for f in os.listdir(DOWNLOAD_DIR) if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))]
-
-            if not downloaded_files:
-                self.status_update("no images found in download directory")
-                messagebox.showinfo("no Images", "no images found to watermark")
+            # traverse all code-named folders in downloaded_images
+            total_images = 0
+            processed_images = 0
+            if not os.path.exists(DOWNLOAD_DIR):
+                self.status_update("No download directory found")
+                messagebox.showinfo("No Images", "No images found to watermark")
                 return
 
-            self.status_update(f"Found {len(downloaded_files)} images to watermark")
+            code_folders = [d for d in os.listdir(DOWNLOAD_DIR) if os.path.isdir(os.path.join(DOWNLOAD_DIR, d))]
+            if not code_folders:
+                self.status_update("no code column folders found in download directory")
+                messagebox.showinfo("No Images", "No images found to watermark")
+                return
 
-            # processing here
-            for i, fname in enumerate(downloaded_files):
-                self.status_update(f"Watermarking {i+1}/{len(downloaded_files)}: {fname}")
-                src = os.path.join(DOWNLOAD_DIR, fname)
-                dst = os.path.join(OUTPUT_DIR, fname)
-
-                try:
-                    add_border_and_watermark(src, dst)
-                    self.status_update(f"✓ {fname}")
-                except Exception as e:
-                    self.status_update(f"✗ {fname}: {e}")
+            for code in code_folders:
+                code_dir = os.path.join(DOWNLOAD_DIR, code)
+                output_code_dir = os.path.join(OUTPUT_DIR, code)
+                ensure_dir(output_code_dir)
+                images = [f for f in os.listdir(code_dir) if os.path.isfile(os.path.join(code_dir, f))]
+                total_images += len(images)
+                for i, fname in enumerate(images):
+                    src = os.path.join(code_dir, fname)
+                    dst = os.path.join(output_code_dir, fname)
+                    self.status_update(f"Watermarking [{code}] {fname} ({processed_images+1}/{total_images})")
+                    try:
+                        add_border_and_watermark(src, dst)
+                        self.status_update(f"✓ {fname} saved to {output_code_dir}")
+                    except Exception as e:
+                        self.status_update(f"✗ {fname}: {e}")
+                    processed_images += 1
 
             self.status_update("Watermarking process is done")
             messagebox.showinfo("Success", "All images watermarked")

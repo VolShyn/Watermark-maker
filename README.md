@@ -11,4 +11,4 @@ Worth mentioning, it will rewrite all the images in the directory, if you try to
 
 ### Configuration
 
-Defined in `url.py`
+Defined in `fetch.py`
