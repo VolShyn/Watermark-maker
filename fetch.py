@@ -2,13 +2,16 @@ import os
 import cv2
 import requests
 import pandas as pd
+import numpy as np
 from urllib.parse import urlparse
 
-WATERMARK_TEXT = '3D_Print'
-WATERMARK_OPACITY = 0.3       # 0.0 transparent, 1.0 opaque
+WATERMARK_TEXT      = '3D_Print'
+WATERMARK_OPACITY   = 0.3       # 0.0 transparent, 1.0 opaque
 WATERMARK_THICKNESS = 2
-BORDER_COLOR = (228, 100, 0)    # blue border (BGR)
-BORDER_THICKNESS = 10
+BORDER_COLOR        = (228, 100, 0)    # blue border (BGR)
+BORDER_THICKNESS    = 10
+WATERMARK_OPACITY   = 0.25            # 25% opacity
+FONT                = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def ensure_dir(path: str):
@@ -59,39 +62,75 @@ def add_border_and_watermark(in_path: str, out_path: str):
         borderType=cv2.BORDER_CONSTANT,
         value=BORDER_COLOR
     )
+    bh, bw = bordered.shape[:2]  # border width/height
 
     # 2) create transparent overlay for watermark
-    overlay = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
-    overlay[:] = (0, 0, 0)  # make fully black/transparent overlay
+    # overlay = cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    # overlay[:] = (0, 0, 0)  # make fully black/transparent overlay
 
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    # estimate font scale so text width ≈half image width
-    (text_w, text_h), _ = cv2.getTextSize(WATERMARK_TEXT, font, 1.0, WATERMARK_THICKNESS)
+    # create blank mask for text
+    text_mask = np.zeros((bh, bw, 3), dtype=np.uint8)
+
+    # compute text scale
+    (text_w, text_h), baseline = cv2.getTextSize(WATERMARK_TEXT, FONT, 1.0, WATERMARK_THICKNESS)
     scale = (w / 2) / text_w
+
+    # We want text centered inside the bordered area
+    # let’s recompute size at final scale
+    (scaled_w, scaled_h), _ = cv2.getTextSize(WATERMARK_TEXT, FONT, scale, WATERMARK_THICKNESS)
+
+    # center of bordered image:
+    cx, cy = bw // 2, bh // 2
+
+    # top‐left corner so that text is centered:
+    org_x = int(cx - (scaled_w / 2))
+    # for y, popenCV putText uses the _baseline_ of text, so we add scaled_h
+    org_y = int(cy + (scaled_h / 2))
+
     # position at roughly one-quarter down from top, one-quarter in from left
     org = (int((w + 2*BORDER_THICKNESS - text_w*scale) / 2),
            int((h + 2*BORDER_THICKNESS + text_h*scale) / 2))
 
-    # put text onto overlay in white
+    # put text onto text_mask
     cv2.putText(
-        overlay, WATERMARK_TEXT, org,
-        fontFace=font,
-        fontScale=scale,
-        color=(255, 255, 255),
+        text_mask,
+        WATERMARK_TEXT,
+        (org_x, org_y),
+        FONT,
+        scale,
+        (255, 255, 255),
         thickness=WATERMARK_THICKNESS,
         lineType=cv2.LINE_AA
     )
 
     # rotate text 45° for diagonal effect
     M = cv2.getRotationMatrix2D(
-        ( (org[0] + text_w*scale/2), (org[1] - text_h*scale/2) ),
-        angle=-45,
+        (cx, cy),      # rotate around the center of the bordered image
+        angle=-45,     # 45° diagonal
         scale=1.0
     )
-    overlay = cv2.warpAffine(overlay, M, (bordered.shape[1], bordered.shape[0]))
+    rotated_mask = cv2.warpAffine(text_mask, M, (bw, bh),
+                                  flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT,
+                                  borderValue=(0, 0, 0))
 
-    # blend the overlay with the bordered image
-    watermarked = cv2.addWeighted(overlay, WATERMARK_OPACITY, bordered, 1 - WATERMARK_OPACITY, 0)
+    output = bordered.copy()
 
-    cv2.imwrite(out_path, watermarked)
+    # Convert rotated mask to gray so we can threshold it
+    gray_mask = cv2.cvtColor(rotated_mask, cv2.COLOR_BGR2GRAY)
+
+    # werever gray_mask > 0, we know that pixel belongs to the text
+    # we’ll normalize gray_mask to [0–1], then blend only those pixels
+    alpha_mask = (gray_mask.astype(np.float32) / 255.0) * WATERMARK_OPACITY
+
+    # blend
+    for c in range(3):
+        orig_chan = output[:, :, c].astype(np.float32)
+        # wherever the mask is nonzero (i.e. text), blend white (255) with original
+        blended_chan = alpha_mask * 255 + (1 - alpha_mask) * orig_chan
+        # wherever mask == 0, alpha_mask is 0 → blended_chan == orig_chan → unchanged
+        output[:, :, c] = blended_chan.clip(0, 255).astype(np.uint8)
+
+
+    cv2.imwrite(out_path, output)
     print(f"Watermarked saved to {out_path}")
